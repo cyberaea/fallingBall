@@ -1,0 +1,319 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <inttypes.h>
+#include <errno.h>
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_timer.h"
+#include "esp_spiffs.h"
+#include "driver/i2c.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_http_server.h"
+#include "esp_wifi.h"
+#include "lwip/ip_addr.h"
+#include "lwip/sockets.h"
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
+#define I2C_MASTER_NUM              I2C_NUM_0
+#define I2C_MASTER_SDA_IO           21
+#define I2C_MASTER_SCL_IO           22
+#define I2C_MASTER_FREQ_HZ          100000
+#define I2C_MASTER_TIMEOUT_MS       1000
+#define MPU6050_ADDR                0x68
+#define MPU6050_PWR_MGMT_1_REG      0x6B
+#define MPU6050_ACCEL_XOUT_H_REG    0x3B
+#define ACCEL_SCALE_FACTOR          16384.0
+
+static const char *TAG = "MPU6050_LOG";
+static SemaphoreHandle_t spiffs_mutex = NULL;
+static volatile bool recording = false;
+static SemaphoreHandle_t recording_mutex = NULL;
+
+// Прототипы
+static void wifi_init_softap(void);
+static void sensor_task(void *pvParameters);
+static esp_err_t mpu6050_write_reg(uint8_t reg_addr, uint8_t data);
+static esp_err_t mpu6050_read_bytes(uint8_t reg_addr, uint8_t *data, size_t len);
+
+static void i2c_scan(void) {
+    ESP_LOGI(TAG, "Scanning I2C bus for devices…");
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
+        i2c_cmd_link_delete(cmd);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, " -- Device found at 0x%02X", addr);
+        }
+    }
+}
+
+static esp_err_t i2c_master_init(void) {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &conf));
+    return i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+}
+
+static esp_err_t mpu6050_write_reg(uint8_t reg_addr, uint8_t data) {
+    uint8_t buf[2] = { reg_addr, data };
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    esp_err_t ret = i2c_master_start(cmd);
+    ret |= i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    ret |= i2c_master_write(cmd, buf, 2, true);
+    ret |= i2c_master_stop(cmd);
+    ret |= i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+static esp_err_t mpu6050_read_bytes(uint8_t reg_addr, uint8_t *data, size_t len) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    esp_err_t ret = i2c_master_start(cmd)
+                  | i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true)
+                  | i2c_master_write_byte(cmd, reg_addr, true)
+                  | i2c_master_start(cmd)
+                  | i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_READ, true);
+    if (len > 1) i2c_master_read(cmd, data, len - 1, I2C_MASTER_ACK);
+    i2c_master_read_byte(cmd, data + len - 1, I2C_MASTER_NACK);
+    ret |= i2c_master_stop(cmd);
+    ret |= i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+static esp_err_t mpu6050_init(void) {
+    return mpu6050_write_reg(MPU6050_PWR_MGMT_1_REG, 0x00);
+}
+
+static esp_err_t init_spiffs(void) {
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/",                // монтируем в корень VFS
+        .partition_label = "spiffs",     // label из partitions.csv
+        .max_files = 5,
+        .format_if_mount_failed = true
+    };
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPIFFS mount failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+// HTTP-обработчик для /log
+static esp_err_t log_file_get_handler(httpd_req_t *req) {
+    int sock = httpd_req_to_sockfd(req);
+    if (sock >= 0) {
+        struct sockaddr_in addr;
+        socklen_t len = sizeof(addr);
+        if (getpeername(sock, (struct sockaddr*)&addr, &len) == 0) {
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+            ESP_LOGI(TAG, "Request from %s", ip);
+        }
+    }
+
+    if (xSemaphoreTake(spiffs_mutex, pdMS_TO_TICKS(2000))) {
+        FILE *f = fopen("/accel_log.txt", "r");
+        if (!f) {
+            ESP_LOGE(TAG, "File not found: errno=%d", errno);
+            httpd_resp_send_404(req);
+            xSemaphoreGive(spiffs_mutex);
+            return ESP_FAIL;
+        }
+        char buf[128];
+        size_t r;
+        while ((r = fread(buf, 1, sizeof(buf), f)) > 0) {
+            httpd_resp_send_chunk(req, buf, r);
+        }
+        fclose(f);
+        httpd_resp_send_chunk(req, NULL, 0);
+        xSemaphoreGive(spiffs_mutex);
+        return ESP_OK;
+    }
+    ESP_LOGE(TAG, "SPIFFS mutex timeout");
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+}
+
+static httpd_uri_t log_uri = {
+    .uri      = "/log",
+    .method   = HTTP_GET,
+    .handler  = log_file_get_handler,
+    .user_ctx = NULL
+};
+
+static httpd_handle_t start_webserver(void) {
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.lru_purge_enable = true;
+    cfg.max_open_sockets = 5;
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &cfg) == ESP_OK) {
+        httpd_register_uri_handler(server, &log_uri);
+        return server;
+    }
+    ESP_LOGE(TAG, "Failed to start HTTP server");
+    return NULL;
+}
+
+static void wifi_event_handler(void* arg, esp_event_base_t evb, 
+                               int32_t eid, void* ed) {
+    if (eid == WIFI_EVENT_AP_STACONNECTED) {
+        auto* e = (wifi_event_ap_staconnected_t*)ed;
+        ESP_LOGI(TAG, "Station connected: %02x:%02x:%02x:%02x:%02x:%02x",
+                 e->mac[0],e->mac[1],e->mac[2],e->mac[3],e->mac[4],e->mac[5]);
+    }
+}
+
+static void wifi_init_softap(void) {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_t* ap = esp_netif_create_default_wifi_ap();
+    assert(ap);
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                               &wifi_event_handler, NULL));
+    wifi_config_t wcfg = {
+        .ap = {
+            .ssid = "ESP32_AP",
+            .password = "esp32password",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK,
+            .pmf_cfg = {.required = false},
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wcfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_netif_ip_info_t info;
+    IP4_ADDR(&info.ip,      192,168,4,1);
+    IP4_ADDR(&info.gw,      192,168,4,1);
+    IP4_ADDR(&info.netmask, 255,255,255,0);
+    esp_netif_dhcps_stop(ap);
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(ap, &info));
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(ap));
+    ESP_LOGI(TAG, "AP SSID:%s IP:" IPSTR, wcfg.ap.ssid, IP2STR(&info.ip));
+}
+
+static void sensor_task(void* pv) {
+    ESP_LOGI(TAG, "Sensor task started");
+    FILE *f = NULL;
+    uint32_t start_us = 0;
+    const float GYRO_SCALE = 131.0f;
+    while (1) {
+        uint8_t d[14];
+        esp_err_t re = mpu6050_read_bytes(MPU6050_ACCEL_XOUT_H_REG, d, sizeof(d));
+        if (re != ESP_OK) {
+            ESP_LOGE(TAG, "MPU6050 read failed: %s", esp_err_to_name(re));
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        int16_t ax = (d[0]<<8)|d[1], ay = (d[2]<<8)|d[3], az = (d[4]<<8)|d[5];
+        float tot = sqrtf((ax/ACCEL_SCALE_FACTOR)*(ax/ACCEL_SCALE_FACTOR) +
+                          (ay/ACCEL_SCALE_FACTOR)*(ay/ACCEL_SCALE_FACTOR) +
+                          (az/ACCEL_SCALE_FACTOR)*(az/ACCEL_SCALE_FACTOR));
+        int16_t gx = (d[8]<<8)|d[9], gy = (d[10]<<8)|d[11], gz = (d[12]<<8)|d[13];
+        float rx = gx/GYRO_SCALE, ry = gy/GYRO_SCALE, rz = gz/GYRO_SCALE;
+
+        if (xSemaphoreTake(recording_mutex, pdMS_TO_TICKS(1000))) {
+            if (tot > 2.5f && !recording) {
+                recording = true;
+                start_us = esp_timer_get_time();
+                ESP_LOGI(TAG, "Recording started");
+                if (xSemaphoreTake(spiffs_mutex, pdMS_TO_TICKS(1000))) {
+                    ESP_LOGI(TAG, "Opening /accel_log.txt for write");
+                    f = fopen("/accel_log.txt", "w");
+                    if (!f) {
+                        ESP_LOGE(TAG, "Open failed: errno=%d", errno);
+                    } else {
+                        fprintf(f, "{\"start_time\": %" PRIu32 "}\n", start_us);
+                        fflush(f);
+                    }
+                    xSemaphoreGive(spiffs_mutex);
+                }
+            }
+            xSemaphoreGive(recording_mutex);
+        }
+
+        if (recording) {
+            uint32_t now = esp_timer_get_time();
+            if (now - start_us <= 30000000) {
+                char line[256];
+                snprintf(line, sizeof(line),
+                         "{\"t\": %" PRIu32
+                         ", \"ax\": %.3f, \"ay\": %.3f, \"az\": %.3f"
+                         ", \"gx\": %.2f, \"gy\": %.2f, \"gz\": %.2f}\n",
+                         now - start_us,
+                         ax/ACCEL_SCALE_FACTOR,
+                         ay/ACCEL_SCALE_FACTOR,
+                         az/ACCEL_SCALE_FACTOR,
+                         rx, ry, rz);
+                if (xSemaphoreTake(spiffs_mutex, pdMS_TO_TICKS(1000))) {
+                    if (f) {
+                        fprintf(f, "%s", line);
+                        fflush(f);
+                    }
+                    xSemaphoreGive(spiffs_mutex);
+                }
+            } else {
+                recording = false;
+                if (f) { fclose(f); f = NULL; }
+                ESP_LOGI(TAG, "Recording stopped");
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void app_main(void) {
+    spiffs_mutex    = xSemaphoreCreateMutex();
+    recording_mutex = xSemaphoreCreateMutex();
+    if (!spiffs_mutex || !recording_mutex) {
+        ESP_LOGE(TAG, "Mutex creation failed");
+        return;
+    }
+
+    ESP_ERROR_CHECK(i2c_master_init());
+    i2c_scan();
+
+    esp_err_t mi = mpu6050_init();
+    if (mi != ESP_OK) {
+        ESP_LOGE(TAG, "MPU6050 init failed: %s", esp_err_to_name(mi));
+    } else {
+        ESP_LOGI(TAG, "MPU6050 initialized");
+    }
+
+    // Монтируем SPIFFS в корень
+    if (init_spiffs() != ESP_OK) {
+        ESP_LOGE(TAG, "SPIFFS mount failed");
+    } else {
+        ESP_LOGI(TAG, "SPIFFS mounted");
+    }
+
+    wifi_init_softap();
+    if (!start_webserver()) {
+        ESP_LOGE(TAG, "HTTP server start failed");
+        return;
+    }
+
+    xTaskCreate(sensor_task, "sensor", 4096, NULL, 5, NULL);
+    ESP_LOGI(TAG, "System initialized");
+}
