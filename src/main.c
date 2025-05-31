@@ -267,7 +267,7 @@ static void read_task(void *arg)
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100)); // читаем с шагом 100 мс
+        vTaskDelay(pdMS_TO_TICKS(10)); // читаем с шагом 10 мс
     }
 }
 
