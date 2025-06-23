@@ -1,3 +1,7 @@
 .pio
 .gitignore
 .vscode/
+accel_log.txt
+accel.csv
+cal_e.py
+graph.py
