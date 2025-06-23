@@ -35,7 +35,7 @@ def preprocess_file(fname):
     df = df.apply(pd.to_numeric, errors='coerce').dropna()
     acc = np.sqrt(df['ax']**2 + df['ay']**2 + df['az']**2)
     # Hampel
-    acc_h = hampel_filter(acc, window_size=60, n_sigmas=0.3)
+    acc_h = hampel_filter(acc, window_size=60, n_sigmas=1)
     # Savitzky–Golay: подбираем нечётное window_length <= len(acc_h)
     n = len(acc_h)
     if n >= 3:

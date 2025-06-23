@@ -19,13 +19,13 @@ def plot_and_save_moving_average(csv_file, window_size, window_type='uniform', o
         raise ValueError("window_type must be 'uniform' or 'triangular'")
     w = w / w.sum()
 
-    # Сглаживание с режимом 'valid'
-    smoothed_valid = np.convolve(a_frac, w, mode='valid')
-    # Паддинг: дублируем первое и последнее значение
-    pad = (len(a_frac) - len(smoothed_valid)) // 2
-    start_pad = np.full(pad, smoothed_valid[0])
-    end_pad = np.full(len(a_frac) - len(smoothed_valid) - pad, smoothed_valid[-1])
-    smoothed = np.concatenate([start_pad, smoothed_valid, end_pad])
+    # Паддим данные зеркально, чтобы свёртка 'same' дала корректные края
+    pad_len = window_size // 2
+    a_padded = np.pad(a_frac, pad_len, mode='reflect')
+    
+    # Сглаживаем полным окном и берём центральную часть
+    smoothed_full = np.convolve(a_padded, w, mode='same')
+    smoothed = smoothed_full[pad_len:pad_len + len(a_frac)]
 
     # Сохранение в файл
     out_df = pd.DataFrame({'t_ms': t_ms, 'smoothed_frac': smoothed})
@@ -37,11 +37,10 @@ def plot_and_save_moving_average(csv_file, window_size, window_type='uniform', o
     plt.plot(t, smoothed, '-', label=f'Сглажено (N={window_size})')
     plt.xlabel('t, с')
     plt.ylabel('Доля от g')
-    plt.title('Сглаживание без провалов на краях')
+    plt.title('Сглаживание без провалов на краях (reflect padding)')
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
     plt.show()
 
-plot_and_save_moving_average('combined_smoothed.csv', window_size=12, window_type='uniform', output_file='smoothed.csv')
-
+plot_and_save_moving_average('combined_smoothed.csv', window_size=10, window_type='triangular', output_file='smoothed.csv')
