@@ -2,7 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # Чтение файла accel.csv
-df = pd.read_csv("accel2.csv", header=None, names=["t_ms", "ax", "ay", "az"])
+df = pd.read_csv("accel1.csv", header=None, names=["t_ms", "ax", "ay", "az"])
 
 # Вычисление модуля ускорения
 df["g_total"] = (df["ax"]**2 + df["ay"]**2 + df["az"]**2)**0.5
